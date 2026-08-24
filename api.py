@@ -44,6 +44,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.get("/")
+async def root():
+    return {"message": "Antigravity Avrupa Rehber Doğrulama API'si başarıyla çalışıyor!", "status": "active"}
+
 @app.get("/health")
 async def health_check():
     return {"status": "ok"}
