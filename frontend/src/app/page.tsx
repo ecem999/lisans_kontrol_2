@@ -6,7 +6,10 @@ import BatchUploadZone from '@/components/BatchUploadZone';
 import StatusCard from '@/components/StatusCard';
 import { ShieldCheck, FileText, Camera, Layers } from 'lucide-react';
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8002";
+let API_URL = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8002";
+if (API_URL && !API_URL.startsWith("http")) {
+  API_URL = "https://" + API_URL;
+}
 
 export default function Home() {
   const [activeTab, setActiveTab] = useState<'manual' | 'ocr' | 'batch'>('manual');
