@@ -2,13 +2,14 @@
 import { useState } from 'react';
 import DynamicForm from '@/components/DynamicForm';
 import UploadZone from '@/components/UploadZone';
+import BatchUploadZone from '@/components/BatchUploadZone';
 import StatusCard from '@/components/StatusCard';
-import { ShieldCheck, FileText, Camera } from 'lucide-react';
+import { ShieldCheck, FileText, Camera, Layers } from 'lucide-react';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8002";
 
 export default function Home() {
-  const [activeTab, setActiveTab] = useState<'manual' | 'ocr'>('manual');
+  const [activeTab, setActiveTab] = useState<'manual' | 'ocr' | 'batch'>('manual');
   const [result, setResult] = useState<any>(null);
   const [isLoading, setIsLoading] = useState(false);
 
@@ -42,6 +43,43 @@ export default function Home() {
       const resData = await res.json();
       if (!res.ok) throw new Error(resData.detail?.message || resData.detail || "Görsel işleme hatası");
       setResult(resData);
+    } catch (error: any) {
+      setResult({ status: "INVALID", label: "İstek Başarısız", message: error.message });
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handleBatchUpload = async (formData: FormData) => {
+    setIsLoading(true);
+    setResult(null);
+    try {
+      const res = await fetch(`${API_URL}/api/verify/batch`, {
+        method: "POST",
+        body: formData
+      });
+      
+      if (!res.ok) {
+          const resData = await res.json().catch(() => null);
+          throw new Error(resData?.detail?.message || resData?.detail || "Toplu işlem hatası");
+      }
+      
+      // Blob olarak indir
+      const blob = await res.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "veritabani_log.xlsx";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      window.URL.revokeObjectURL(url);
+      
+      setResult({ 
+          status: "VALID", 
+          label: "İşlem Tamamlandı", 
+          message: "Toplu log dosyası başarıyla indirildi. Dosyayı kontrol edebilirsiniz." 
+      });
     } catch (error: any) {
       setResult({ status: "INVALID", label: "İstek Başarısız", message: error.message });
     } finally {
@@ -88,15 +126,19 @@ export default function Home() {
             >
               <Camera className="w-4 h-4" /> Görsel Yükle (OCR)
             </button>
+            <button 
+              onClick={() => { setActiveTab('batch'); setResult(null); }} 
+              className={`flex-1 flex justify-center items-center gap-2 py-3 rounded-lg text-sm font-semibold transition-all duration-300 ${activeTab === 'batch' ? 'bg-gradient-to-r from-blue-600 to-indigo-600 text-white shadow-lg' : 'text-slate-400 hover:text-white hover:bg-white/5'}`}
+            >
+              <Layers className="w-4 h-4" /> Toplu İşlem (Batch)
+            </button>
           </div>
 
           {/* Active Component */}
           <div className="min-h-[300px]">
-            {activeTab === 'manual' ? (
-              <DynamicForm onSubmit={handleManualSubmit} isLoading={isLoading} />
-            ) : (
-              <UploadZone onUpload={handleImageUpload} isLoading={isLoading} />
-            )}
+            {activeTab === 'manual' && <DynamicForm onSubmit={handleManualSubmit} isLoading={isLoading} />}
+            {activeTab === 'ocr' && <UploadZone onUpload={handleImageUpload} isLoading={isLoading} />}
+            {activeTab === 'batch' && <BatchUploadZone onUpload={handleBatchUpload} isLoading={isLoading} />}
           </div>
 
         </div>

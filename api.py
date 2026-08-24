@@ -18,6 +18,11 @@ from utils.ocr_service import OCRService
 from utils.visual_matcher import VisualMatcher
 from config import COUNTRIES_CONFIG
 from utils.logger import get_logger
+from utils.excel_logger import append_logs
+import zipfile
+import tempfile
+from fastapi.responses import FileResponse
+from typing import List
 
 logger = get_logger(__name__)
 
@@ -80,20 +85,7 @@ async def verify_manual(request: GuideDataRequest):
         raise HTTPException(status_code=500, detail=f"Sunucu hatası: {str(e)}")
 
 
-@app.post("/api/verify/image")
-async def verify_image(
-    country: str = Form(...),
-    region: Optional[str] = Form(None),
-    file: UploadFile = File(...)
-):
-    """Yüklenen görseli OCR'dan geçirir ve elde edilen verilerle doğrulama yapar."""
-    file_ext = file.filename.split(".")[-1]
-    unique_filename = f"{uuid.uuid4()}.{file_ext}"
-    file_path = os.path.join(UPLOAD_DIR, unique_filename)
-    
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-        
+async def process_image_core(file_path: str, original_filename: str, country: str, region: Optional[str]) -> dict:
     try:
         from PIL import Image, ImageEnhance
         with Image.open(file_path) as im:
@@ -120,7 +112,13 @@ async def verify_image(
         
         if ocr_result["status"] != "SUCCESS":
             logger.warning(f"OCR Başarısız: {ocr_result}")
-            raise HTTPException(status_code=400, detail={"error": "OCR_FAILED", "message": ocr_result.get("message", "Görsel işlenemedi.")})
+            return {
+                "filename": original_filename,
+                "status": "ERROR",
+                "label": "OCR_FAILED",
+                "message": ocr_result.get("message", "Görsel işlenemedi."),
+                "extracted_data": {"country": country, "region": region}
+            }
             
         ocr_extracted_data = ocr_result["guide_data"]
         
@@ -138,19 +136,11 @@ async def verify_image(
             if match_result["match_found"]:
                 res_region = match_result["region"]
                 score = match_result["score"]
-                # region_name -> 'cataluna' gibi geldiğinden config üzerinden ismini bulalım
-                # Eğer config'de birebir eşleşen key yoksa, adını capitalize yapalım.
-                # Mesela 'cataluna' dosya adı, config key'i 'catalunya' olabilir. 
-                # Ama referans verisinde cataluna_name gibi doğrudan bir map'imiz var.
-                # 'aragon.jpg' -> 'aragon' -> 'Aragón'
-                # Ancak dosya adı ile config key eşleşmeyebilir (cataluna vs catalunya).
-                # Bunun için COUNTRIES_CONFIG'den bulmaya çalışalım.
                 name = None
                 for key, val in COUNTRIES_CONFIG["spain"]["regions"].items():
-                    # Dosya yolu üzerinden eşleştir (ör: "cataluna.jpg" geçiyorsa)
                     if f"{res_region}.jpg" in val.get("reference_image", ""):
                         name = val.get("name")
-                        res_region = key # config'deki asıl key'i de alalım
+                        res_region = key 
                         break
                 if not name:
                     name = res_region.capitalize()
@@ -164,7 +154,13 @@ async def verify_image(
                 score = match_result["score"]
                 matches_count = match_result.get("matches_count", 0)
                 logger.warning(f"Visual Match başarısız veya eşik değerin altında kaldı. (Score: {score}%, Matches: {matches_count})")
-                raise HTTPException(status_code=400, detail={"error": "MISSING_REGION", "message": match_result["message"]})
+                return {
+                    "filename": original_filename,
+                    "status": "ERROR",
+                    "label": "MISSING_REGION",
+                    "message": match_result["message"],
+                    "extracted_data": {"country": country, "region": region}
+                }
         
         guide_data = {
             "country": country,
@@ -179,6 +175,7 @@ async def verify_image(
             validator = ValidatorFactory.get_validator(country.lower())
             result = await validator.verify_guide(guide_data)
             result["country"] = validator.country_code
+            result["filename"] = original_filename
             
             if detected_region:
                 result["detected_region"] = detected_region
@@ -189,9 +186,116 @@ async def verify_image(
             result["extracted_data"] = guide_data
             return result
         except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e))
-    except HTTPException:
-        raise
+            return {
+                "filename": original_filename,
+                "status": "ERROR",
+                "label": "VALIDATION_ERROR",
+                "message": str(e),
+                "extracted_data": guide_data
+            }
     except Exception as e:
         logger.error(f"OCR/Doğrulama hatası: {e}")
-        raise HTTPException(status_code=500, detail=f"Görsel işleme hatası: {str(e)}")
+        return {
+            "filename": original_filename,
+            "status": "ERROR",
+            "label": "SERVER_ERROR",
+            "message": f"Görsel işleme hatası: {str(e)}",
+            "extracted_data": {"country": country, "region": region}
+        }
+
+
+@app.post("/api/verify/image")
+async def verify_image(
+    country: str = Form(...),
+    region: Optional[str] = Form(None),
+    file: UploadFile = File(...)
+):
+    """Yüklenen görseli OCR'dan geçirir ve elde edilen verilerle doğrulama yapar."""
+    file_ext = file.filename.split(".")[-1]
+    unique_filename = f"{uuid.uuid4()}.{file_ext}"
+    file_path = os.path.join(UPLOAD_DIR, unique_filename)
+    
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+        
+    result = await process_image_core(file_path, file.filename, country, region)
+    
+    if result.get("status") == "ERROR":
+        status_code = 400
+        if result.get("label") == "SERVER_ERROR":
+            status_code = 500
+        raise HTTPException(status_code=status_code, detail={"error": result.get("label"), "message": result.get("message")})
+        
+    return result
+
+
+@app.post("/api/verify/batch")
+async def verify_batch(
+    country: str = Form(...),
+    region: Optional[str] = Form(None),
+    files: List[UploadFile] = File(...)
+):
+    """
+    Çoklu resim veya tek bir ZIP dosyası yükleyerek toplu doğrulama yapar.
+    Sonuçları data/veritabani_log.xlsx dosyasına ekler ve bu dosyayı döndürür.
+    """
+    results = []
+    
+    with tempfile.TemporaryDirectory() as temp_dir:
+        # Eğer tek bir dosya yüklendiyse ve bu bir ZIP dosyasıysa
+        if len(files) == 1 and files[0].filename.lower().endswith(".zip"):
+            zip_path = os.path.join(temp_dir, files[0].filename)
+            with open(zip_path, "wb") as buffer:
+                shutil.copyfileobj(files[0].file, buffer)
+                
+            try:
+                with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                    zip_ref.extractall(temp_dir)
+            except zipfile.BadZipFile:
+                raise HTTPException(status_code=400, detail="Geçersiz ZIP dosyası.")
+                
+            # ZIP içindeki resimleri bul (Mac OS __MACOSX gibi gizli klasörleri atla)
+            for root, _, extracted_files in os.walk(temp_dir):
+                if "__MACOSX" in root:
+                    continue
+                for filename in extracted_files:
+                    if filename.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
+                        file_path = os.path.join(root, filename)
+                        res = await process_image_core(file_path, filename, country, region)
+                        results.append(res)
+        else:
+            # Doğrudan birden fazla (veya tek) resim yüklendiyse
+            for file in files:
+                if not file.filename.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
+                    results.append({
+                        "filename": file.filename,
+                        "status": "ERROR",
+                        "label": "INVALID_FILE_TYPE",
+                        "message": "Desteklenmeyen dosya formatı.",
+                        "extracted_data": {"country": country, "region": region}
+                    })
+                    continue
+                    
+                file_path = os.path.join(temp_dir, file.filename)
+                with open(file_path, "wb") as buffer:
+                    shutil.copyfileobj(file.file, buffer)
+                    
+                res = await process_image_core(file_path, file.filename, country, region)
+                results.append(res)
+                
+    if not results:
+        raise HTTPException(status_code=400, detail="İşlenecek geçerli resim bulunamadı.")
+        
+    # Excel dosyasına ekle
+    append_logs(results)
+    
+    # Oluşturulan Excel dosyasını döndür
+    log_file_path = "data/veritabani_log.xlsx"
+    if not os.path.exists(log_file_path):
+        raise HTTPException(status_code=500, detail="Log dosyası oluşturulamadı.")
+        
+    return FileResponse(
+        path=log_file_path,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename="veritabani_log.xlsx"
+    )

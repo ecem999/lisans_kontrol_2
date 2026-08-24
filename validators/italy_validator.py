@@ -30,13 +30,45 @@ class ItalyValidator(BaseValidator):
         return await self._check_national_db(guide_data)
 
     async def _verify_via_qr(self, qr_url: str) -> dict:
-        # QR linkine doğrudan bir GET isteği atıp HTTP 200 dönüp dönmediğini (aktif mi) kontrol edeceğiz.
-        return {
-            "status": "VALID",
-            "label": "QR Tespit Edildi",
-            "url": qr_url,
-            "message": f"Bu belgede resmi bir QR kod tespit edildi. Doğrulamak için yandaki butona tıklayın."
-        }
+        import requests
+        import asyncio
+        
+        # Sadece resmi domain'leri kabul et
+        official_domains = ["ministeroturismo.gov.it", "turismo.gov.it"]
+        is_official = any(domain in qr_url for domain in official_domains)
+        
+        if not is_official:
+            return {
+                "status": "UNKNOWN",
+                "label": "Geçersiz Domain",
+                "url": qr_url,
+                "message": "QR kod resmi bakanlık domainine ait değil."
+            }
+            
+        try:
+            # IO işlemini bloklamamak için asyncio.to_thread ile çalıştırıyoruz
+            response = await asyncio.to_thread(requests.get, qr_url, timeout=10)
+            if response.status_code == 200:
+                return {
+                    "status": "VALID",
+                    "label": "Sistemden Döndü (QR)",
+                    "url": qr_url,
+                    "message": "QR kod resmi sistemde başarıyla doğrulandı."
+                }
+            else:
+                return {
+                    "status": "INVALID",
+                    "label": "Bulunamadı (QR)",
+                    "url": qr_url,
+                    "message": f"QR kod sayfasına ulaşılamadı (HTTP {response.status_code})."
+                }
+        except Exception as e:
+            return {
+                "status": "UNKNOWN",
+                "label": "Bağlantı Hatası",
+                "url": qr_url,
+                "message": f"QR kod doğrulanırken hata oluştu: {str(e)}"
+            }
 
     async def _check_national_db(self, guide_data: dict) -> dict:
         from utils.excel_validator import check_guide_in_excel
